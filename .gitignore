@@ -171,3 +171,5 @@ CMakeListsPrivate.txt
 
 #CLion
 cmake-build-*
+.vscode/.browse.c_cpp.db*
+.vscode/launch.json
