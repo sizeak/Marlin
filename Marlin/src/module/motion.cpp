@@ -1117,16 +1117,9 @@ static void do_homing_move(const AxisEnum axis, const float distance, const floa
 
   if (is_home_dir) {
 
-    if (axis == Z_AXIS) {
-      #if HOMING_Z_WITH_PROBE
-        #if ENABLED(BLTOUCH)
-          set_bltouch_deployed(true);
-        #endif
-        #if QUIET_PROBING
-          probing_pause(true);
-        #endif
-      #endif
-    }
+    #if HOMING_Z_WITH_PROBE && QUIET_PROBING
+      if (axis == Z_AXIS) probing_pause(true);
+    #endif
 
     // Disable stealthChop if used. Enable diag1 pin on driver.
     #if ENABLED(SENSORLESS_HOMING)
@@ -1152,16 +1145,9 @@ static void do_homing_move(const AxisEnum axis, const float distance, const floa
 
   if (is_home_dir) {
 
-    if (axis == Z_AXIS) {
-      #if HOMING_Z_WITH_PROBE
-        #if QUIET_PROBING
-          probing_pause(false);
-        #endif
-        #if ENABLED(BLTOUCH)
-          set_bltouch_deployed(false);
-        #endif
-      #endif
-    }
+    #if HOMING_Z_WITH_PROBE && QUIET_PROBING
+      if (axis == Z_AXIS) probing_pause(false);
+    #endif
 
     endstops.validate_homing_move();
 
@@ -1335,7 +1321,18 @@ void homeaxis(const AxisEnum axis) {
   #if ENABLED(DEBUG_LEVELING_FEATURE)
     if (DEBUGGING(LEVELING)) SERIAL_ECHOLNPGM("Home 1 Fast:");
   #endif
+
+  #if HOMING_Z_WITH_PROBE && ENABLED(BLTOUCH)
+    // BLTOUCH needs to be deployed every time
+    if (axis == Z_AXIS && set_bltouch_deployed(true)) return;
+  #endif
+
   do_homing_move(axis, 1.5f * max_length(axis) * axis_home_dir);
+
+  #if HOMING_Z_WITH_PROBE && ENABLED(BLTOUCH)
+    // BLTOUCH needs to be stowed after trigger to rearm itself
+    if (axis == Z_AXIS) set_bltouch_deployed(false);
+  #endif
 
   // When homing Z with probe respect probe clearance
   const float bump = axis_home_dir * (
@@ -1361,7 +1358,18 @@ void homeaxis(const AxisEnum axis) {
     #if ENABLED(DEBUG_LEVELING_FEATURE)
       if (DEBUGGING(LEVELING)) SERIAL_ECHOLNPGM("Home 2 Slow:");
     #endif
+
+    #if HOMING_Z_WITH_PROBE && ENABLED(BLTOUCH)
+      // BLTOUCH needs to be deployed every time
+      if (axis == Z_AXIS && set_bltouch_deployed(true)) return;
+    #endif
+
     do_homing_move(axis, 2 * bump, get_homing_bump_feedrate(axis));
+
+    #if HOMING_Z_WITH_PROBE && ENABLED(BLTOUCH)
+      // BLTOUCH needs to be stowed after trigger to rearm itself
+      if (axis == Z_AXIS) set_bltouch_deployed(false);
+    #endif
   }
 
   #if ENABLED(X_DUAL_ENDSTOPS) || ENABLED(Y_DUAL_ENDSTOPS) || ENABLED(Z_DUAL_ENDSTOPS)
@@ -1369,28 +1377,34 @@ void homeaxis(const AxisEnum axis) {
     #if ENABLED(X_DUAL_ENDSTOPS)
       if (axis == X_AXIS) {
         const float adj = ABS(endstops.x_endstop_adj);
-        if (pos_dir ? (endstops.x_endstop_adj > 0) : (endstops.x_endstop_adj < 0)) stepper.set_x_lock(true); else stepper.set_x2_lock(true);
-        do_homing_move(axis, pos_dir ? -adj : adj);
-        stepper.set_x_lock(false);
-        stepper.set_x2_lock(false);
+        if (adj) {
+          if (pos_dir ? (endstops.x_endstop_adj > 0) : (endstops.x_endstop_adj < 0)) stepper.set_x_lock(true); else stepper.set_x2_lock(true);
+          do_homing_move(axis, pos_dir ? -adj : adj);
+          stepper.set_x_lock(false);
+          stepper.set_x2_lock(false);
+        }
       }
     #endif
     #if ENABLED(Y_DUAL_ENDSTOPS)
       if (axis == Y_AXIS) {
         const float adj = ABS(endstops.y_endstop_adj);
-        if (pos_dir ? (endstops.y_endstop_adj > 0) : (endstops.y_endstop_adj < 0)) stepper.set_y_lock(true); else stepper.set_y2_lock(true);
-        do_homing_move(axis, pos_dir ? -adj : adj);
-        stepper.set_y_lock(false);
-        stepper.set_y2_lock(false);
+        if (adj) {
+          if (pos_dir ? (endstops.y_endstop_adj > 0) : (endstops.y_endstop_adj < 0)) stepper.set_y_lock(true); else stepper.set_y2_lock(true);
+          do_homing_move(axis, pos_dir ? -adj : adj);
+          stepper.set_y_lock(false);
+          stepper.set_y2_lock(false);
+        }
       }
     #endif
     #if ENABLED(Z_DUAL_ENDSTOPS)
       if (axis == Z_AXIS) {
         const float adj = ABS(endstops.z_endstop_adj);
-        if (pos_dir ? (endstops.z_endstop_adj > 0) : (endstops.z_endstop_adj < 0)) stepper.set_z_lock(true); else stepper.set_z2_lock(true);
-        do_homing_move(axis, pos_dir ? -adj : adj);
-        stepper.set_z_lock(false);
-        stepper.set_z2_lock(false);
+        if (adj) {
+          if (pos_dir ? (endstops.z_endstop_adj > 0) : (endstops.z_endstop_adj < 0)) stepper.set_z_lock(true); else stepper.set_z2_lock(true);
+          do_homing_move(axis, pos_dir ? -adj : adj);
+          stepper.set_z_lock(false);
+          stepper.set_z2_lock(false);
+        }
       }
     #endif
     stepper.set_homing_dual_axis(false);
@@ -1469,7 +1483,7 @@ void homeaxis(const AxisEnum axis) {
       if (axis == X_AXIS) {
 
         // In Dual X mode hotend_offset[X] is T1's home position
-        float dual_max_x = MAX(hotend_offset[X_AXIS][1], X2_MAX_POS);
+        const float dual_max_x = MAX(hotend_offset[X_AXIS][1], X2_MAX_POS);
 
         if (active_extruder != 0) {
           // T1 can move from X2_MIN_POS to X2_MAX_POS or X2 home position (whichever is larger)
