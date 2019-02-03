@@ -40,6 +40,12 @@
 #include "sd/cardreader.h"
 #include "module/configuration_store.h"
 #include "module/printcounter.h" // PrintCounter or Stopwatch
+#include "feature/closedloop.h"
+
+#include "HAL/shared/Delay.h"
+
+#include "module/stepper_indirection.h"
+
 #ifdef ARDUINO
   #include <pins_arduino.h>
 #endif
@@ -150,33 +156,22 @@
   #include "feature/controllerfan.h"
 #endif
 
-bool Running = true;
+#if ENABLED(PRUSA_MMU2)
+  #include "feature/prusa_MMU2/mmu2.h"
+#endif
 
-/**
- * axis_homed
- *   Flags that each linear axis was homed.
- *   XYZ on cartesian, ABC on delta, ABZ on SCARA.
- *
- * axis_known_position
- *   Flags that the position is known in each linear axis. Set when homed.
- *   Cleared whenever a stepper powers off, potentially losing its position.
- */
-uint8_t axis_homed, axis_known_position; // = 0
+#if ENABLED(EXTENSIBLE_UI)
+  #include "lcd/extensible_ui/ui_api.h"
+#endif
+
+#if HAS_DRIVER(L6470)
+  #include "libs/L6470/L6470_Marlin.h"
+#endif
+
+bool Running = true;
 
 #if ENABLED(TEMPERATURE_UNITS_SUPPORT)
   TempUnit input_temp_units = TEMPUNIT_C;
-#endif
-
-#if FAN_COUNT > 0
-  int16_t fanSpeeds[FAN_COUNT] = { 0 };
-  #if ENABLED(EXTRA_FAN_SPEED)
-    int16_t old_fanSpeeds[FAN_COUNT],
-            new_fanSpeeds[FAN_COUNT];
-  #endif
-  #if ENABLED(PROBING_FANS_OFF)
-    bool fans_paused; // = false;
-    int16_t paused_fanSpeeds[FAN_COUNT] = { 0 };
-  #endif
 #endif
 
 // For M109 and M190, this flag may be cleared (by M108) to exit the wait loop
@@ -195,9 +190,9 @@ volatile bool wait_for_heatup = true;
 millis_t max_inactive_time, // = 0
          stepper_inactive_time = (DEFAULT_STEPPER_DEACTIVE_TIME) * 1000UL;
 
-#ifdef CHDK
-  millis_t chdkHigh; // = 0;
-  bool chdkActive; // = false;
+#if PIN_EXISTS(CHDK)
+  extern bool chdk_active;
+  extern millis_t chdk_timeout;
 #endif
 
 #if ENABLED(I2C_POSITION_ENCODERS)
@@ -254,6 +249,9 @@ void setup_powerhold() {
 /**
  * Sensitive pin test for M42, M226
  */
+
+#include "pins/sensitive_pins.h"
+
 bool pin_is_protected(const pin_t pin) {
   static const pin_t sensitive_pins[] PROGMEM = SENSITIVE_PINS;
   for (uint8_t i = 0; i < COUNT(sensitive_pins); i++) {
@@ -265,15 +263,14 @@ bool pin_is_protected(const pin_t pin) {
 }
 
 void protected_pin_err() {
-  SERIAL_ERROR_START();
-  SERIAL_ERRORLNPGM(MSG_ERR_PROTECTED_PIN);
+  SERIAL_ERROR_MSG(MSG_ERR_PROTECTED_PIN);
 }
 
 void quickstop_stepper() {
   planner.quick_stop();
   planner.synchronize();
   set_current_from_steppers_for_axis(ALL_AXES);
-  SYNC_PLAN_POSITION_KINEMATIC();
+  sync_plan_position();
 }
 
 void enable_all_steppers() {
@@ -288,6 +285,7 @@ void enable_all_steppers() {
   enable_E2();
   enable_E3();
   enable_E4();
+  enable_E5();
 }
 
 void disable_e_steppers() {
@@ -296,6 +294,7 @@ void disable_e_steppers() {
   disable_E2();
   disable_E3();
   disable_E4();
+  disable_E5();
 }
 
 void disable_e_stepper(const uint8_t e) {
@@ -305,6 +304,7 @@ void disable_e_stepper(const uint8_t e) {
     case 2: disable_E2(); break;
     case 3: disable_E3(); break;
     case 4: disable_E4(); break;
+    case 5: disable_E5(); break;
   }
 }
 
@@ -315,13 +315,45 @@ void disable_all_steppers() {
   disable_e_steppers();
 }
 
+#if HAS_ACTION_COMMANDS
+
+  void host_action(const char * const pstr, const bool eol=true) {
+    SERIAL_ECHOPGM("//action:");
+    serialprintPGM(pstr);
+    if (eol) SERIAL_EOL();
+  }
+
+  #ifdef ACTION_ON_KILL
+    void host_action_kill() { host_action(PSTR(ACTION_ON_KILL)); }
+  #endif
+  #ifdef ACTION_ON_PAUSE
+    void host_action_pause() { host_action(PSTR(ACTION_ON_PAUSE)); }
+  #endif
+  #ifdef ACTION_ON_PAUSED
+    void host_action_paused() { host_action(PSTR(ACTION_ON_PAUSED)); }
+  #endif
+  #ifdef ACTION_ON_RESUME
+    void host_action_resume() { host_action(PSTR(ACTION_ON_RESUME)); }
+  #endif
+  #ifdef ACTION_ON_RESUMED
+    void host_action_resumed() { host_action(PSTR(ACTION_ON_RESUMED)); }
+  #endif
+  #ifdef ACTION_ON_CANCEL
+    void host_action_cancel() { host_action(PSTR(ACTION_ON_CANCEL)); }
+  #endif
+  #ifdef ACTION_ON_FILAMENT_RUNOUT
+    void host_action_filament_runout(const bool eol/*=true*/) { host_action(PSTR(ACTION_ON_FILAMENT_RUNOUT), eol); }
+  #endif
+
+#endif // HAS_ACTION_COMMANDS
+
 /**
  * Manage several activities:
  *  - Check for Filament Runout
  *  - Keep the command buffer full
  *  - Check for maximum inactive time between commands
  *  - Check for maximum inactive time between stepper commands
- *  - Check if pin CHDK needs to go LOW
+ *  - Check if CHDK_PIN needs to go LOW
  *  - Check for KILL button held down
  *  - Check for HOME button held down
  *  - Check if cooling fan needs to be switched on
@@ -340,7 +372,7 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
   if (max_inactive_time && ELAPSED(ms, gcode.previous_move_ms + max_inactive_time)) {
     SERIAL_ERROR_START();
     SERIAL_ECHOLNPAIR(MSG_KILL_INACTIVE_TIME, parser.command_ptr);
-    kill(PSTR(MSG_KILLED));
+    kill();
   }
 
   // Prevent steppers timing-out in the middle of M600
@@ -351,31 +383,40 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
   #endif
 
   if (stepper_inactive_time) {
+    static bool already_shutdown_steppers; // = false
     if (planner.has_blocks_queued())
       gcode.previous_move_ms = ms; // reset_stepper_timeout to keep steppers powered
     else if (MOVE_AWAY_TEST && !ignore_stepper_queue && ELAPSED(ms, gcode.previous_move_ms + stepper_inactive_time)) {
-      #if ENABLED(DISABLE_INACTIVE_X)
-        disable_X();
-      #endif
-      #if ENABLED(DISABLE_INACTIVE_Y)
-        disable_Y();
-      #endif
-      #if ENABLED(DISABLE_INACTIVE_Z)
-        disable_Z();
-      #endif
-      #if ENABLED(DISABLE_INACTIVE_E)
-        disable_e_steppers();
-      #endif
-      #if ENABLED(AUTO_BED_LEVELING_UBL) && ENABLED(ULTIPANEL)  // Only needed with an LCD
-        if (ubl.lcd_map_control) ubl.lcd_map_control = defer_return_to_status = false;
-      #endif
+      if (!already_shutdown_steppers) {
+        already_shutdown_steppers = true;  // L6470 SPI will consume 99% of free time without this
+        #if ENABLED(DISABLE_INACTIVE_X)
+          disable_X();
+        #endif
+        #if ENABLED(DISABLE_INACTIVE_Y)
+          disable_Y();
+        #endif
+        #if ENABLED(DISABLE_INACTIVE_Z)
+          disable_Z();
+        #endif
+        #if ENABLED(DISABLE_INACTIVE_E)
+          disable_e_steppers();
+        #endif
+        #if HAS_LCD_MENU && ENABLED(AUTO_BED_LEVELING_UBL)
+          if (ubl.lcd_map_control) {
+            ubl.lcd_map_control = false;
+            ui.defer_status_screen(false);
+          }
+        #endif
+      }
     }
+    else
+      already_shutdown_steppers = false;
   }
 
-  #ifdef CHDK // Check if pin should be set to LOW after M240 set it to HIGH
-    if (chdkActive && ELAPSED(ms, chdkHigh + CHDK_DELAY)) {
-      chdkActive = false;
-      WRITE(CHDK, LOW);
+  #if PIN_EXISTS(CHDK) // Check if pin should be set to LOW (after M240 set it HIGH)
+    if (chdk_active && ELAPSED(ms, chdk_timeout)) {
+      chdk_active = false;
+      WRITE(CHDK_PIN, LOW);
     }
   #endif
 
@@ -395,9 +436,8 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
     // KILL the machine
     // ----------------------------------------------------------------
     if (killCount >= KILL_DELAY) {
-      SERIAL_ERROR_START();
-      SERIAL_ERRORLNPGM(MSG_KILL_BUTTON);
-      kill(PSTR(MSG_KILLED));
+      SERIAL_ERROR_MSG(MSG_KILL_BUTTON);
+      kill();
     }
   #endif
 
@@ -406,7 +446,7 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
     // ---------------------------------------------------------
     static int homeDebounceCount = 0;   // poor man's debouncing count
     const int HOME_DEBOUNCE_DELAY = 2500;
-    if (!IS_SD_PRINTING && !READ(HOME_PIN)) {
+    if (!IS_SD_PRINTING() && !READ(HOME_PIN)) {
       if (!homeDebounceCount) {
         enqueue_and_echo_commands_P(PSTR("G28"));
         LCD_MESSAGEPGM(MSG_AUTO_HOME);
@@ -438,7 +478,7 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
           #if E_STEPPERS > 1
             case 2: case 3: oldstatus = E1_ENABLE_READ; enable_E1(); break;
             #if E_STEPPERS > 2
-              case 4: oldstatus = E2_ENABLE_READ; enable_E2(); break;
+              case 4: case 5: oldstatus = E2_ENABLE_READ; enable_E2(); break;
             #endif // E_STEPPERS > 2
           #endif // E_STEPPERS > 1
         }
@@ -454,6 +494,9 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
                 case 3: oldstatus = E3_ENABLE_READ; enable_E3(); break;
                 #if E_STEPPERS > 4
                   case 4: oldstatus = E4_ENABLE_READ; enable_E4(); break;
+                  #if E_STEPPERS > 5
+                    case 5: oldstatus = E5_ENABLE_READ; enable_E5(); break;
+                  #endif // E_STEPPERS > 5
                 #endif // E_STEPPERS > 4
               #endif // E_STEPPERS > 3
             #endif // E_STEPPERS > 2
@@ -463,7 +506,7 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
 
       const float olde = current_position[E_AXIS];
       current_position[E_AXIS] += EXTRUDER_RUNOUT_EXTRUDE;
-      planner.buffer_line_kinematic(current_position, MMM_TO_MMS(EXTRUDER_RUNOUT_SPEED), active_extruder);
+      planner.buffer_line(current_position, MMM_TO_MMS(EXTRUDER_RUNOUT_SPEED), active_extruder);
       current_position[E_AXIS] = olde;
       planner.set_e_position_mm(olde);
       planner.synchronize();
@@ -474,7 +517,7 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
           #if E_STEPPERS > 1
             case 2: case 3: oldstatus = E1_ENABLE_WRITE(oldstatus); break;
             #if E_STEPPERS > 2
-              case 4: oldstatus = E2_ENABLE_WRITE(oldstatus); break;
+              case 4: case 5: oldstatus = E2_ENABLE_WRITE(oldstatus); break;
             #endif // E_STEPPERS > 2
           #endif // E_STEPPERS > 1
         }
@@ -489,6 +532,9 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
                 case 3: E3_ENABLE_WRITE(oldstatus); break;
                 #if E_STEPPERS > 4
                   case 4: E4_ENABLE_WRITE(oldstatus); break;
+                  #if E_STEPPERS > 5
+                    case 5: E5_ENABLE_WRITE(oldstatus); break;
+                  #endif // E_STEPPERS > 5
                 #endif // E_STEPPERS > 4
               #endif // E_STEPPERS > 3
             #endif // E_STEPPERS > 2
@@ -518,6 +564,10 @@ void manage_inactivity(const bool ignore_stepper_queue/*=false*/) {
     monitor_tmc_driver();
   #endif
 
+  #if ENABLED(MONITOR_L6470_DRIVER_STATUS)
+    L6470.monitor_driver();
+  #endif
+
   // Limit check_axes_activity frequency to 10Hz
   static millis_t next_check_axes_ms = 0;
   if (ELAPSED(ms, next_check_axes_ms)) {
@@ -535,10 +585,10 @@ void idle(
   #endif
 ) {
   #if ENABLED(MAX7219_DEBUG)
-    Max7219_idle_tasks();
+    max7219.idle_tasks();
   #endif
 
-  lcd_update();
+  ui.update();
 
   #if ENABLED(HOST_KEEPALIVE_FEATURE)
     gcode.host_keepalive();
@@ -582,34 +632,49 @@ void idle(
       #endif
     }
   #endif
+
+  #if ENABLED(USB_FLASH_DRIVE_SUPPORT)
+    Sd2Card::idle();
+  #endif
+
+  #if ENABLED(PRUSA_MMU2)
+    mmu2.mmuLoop();
+  #endif
 }
 
 /**
  * Kill all activity and lock the machine.
  * After this the machine will need to be reset.
  */
-void kill(const char* lcd_msg) {
-  SERIAL_ERROR_START();
-  SERIAL_ERRORLNPGM(MSG_ERR_KILLED);
-
+void kill(PGM_P const lcd_msg/*=NULL*/) {
   thermalManager.disable_all_heaters();
-  disable_all_steppers();
 
-  #if ENABLED(ULTRA_LCD)
-    kill_screen(lcd_msg);
+  SERIAL_ERROR_MSG(MSG_ERR_KILLED);
+
+  #if HAS_SPI_LCD || ENABLED(EXTENSIBLE_UI)
+    ui.kill_screen(lcd_msg ? lcd_msg : PSTR(MSG_KILLED));
   #else
     UNUSED(lcd_msg);
   #endif
 
-  _delay_ms(600); // Wait a short time (allows messages to get out before shutting down.
+  #ifdef ACTION_ON_KILL
+    host_action_kill();
+  #endif
+
+  minkill();
+}
+
+void minkill() {
+
+  // Wait a short time (allows messages to get out before shutting down.
+  for (int i = 1000; i--;) DELAY_US(600);
+
   cli(); // Stop interrupts
 
-  _delay_ms(250); //Wait to ensure all interrupts routines stopped
-  thermalManager.disable_all_heaters(); //turn off heaters again
+  // Wait to ensure all interrupts stopped
+  for (int i = 1000; i--;) DELAY_US(250);
 
-  #ifdef ACTION_ON_KILL
-    SERIAL_ECHOLNPGM("//action:" ACTION_ON_KILL);
-  #endif
+  thermalManager.disable_all_heaters(); // turn off heaters again
 
   #if HAS_POWER_SWITCH
     PSU_OFF();
@@ -632,15 +697,15 @@ void kill(const char* lcd_msg) {
  */
 void stop() {
   thermalManager.disable_all_heaters(); // 'unpause' taken care of in here
+  print_job_timer.stop();
 
   #if ENABLED(PROBING_FANS_OFF)
-    if (fans_paused) fans_pause(false); // put things back the way they were
+    if (thermalManager.fans_paused) thermalManager.set_fans_paused(false); // put things back the way they were
   #endif
 
   if (IsRunning()) {
     Stopped_gcode_LastN = gcode_LastN; // Save last g_code for restart
-    SERIAL_ERROR_START();
-    SERIAL_ERRORLNPGM(MSG_ERR_STOPPED);
+    SERIAL_ERROR_MSG(MSG_ERR_STOPPED);
     LCD_MESSAGEPGM(MSG_STOPPED);
     safe_delay(350);       // allow enough time for messages to get out before stopping
     Running = false;
@@ -671,14 +736,30 @@ void setup() {
     HAL_init();
   #endif
 
-  #if ENABLED(MAX7219_DEBUG)
-    Max7219_init();
+  #if HAS_DRIVER(L6470)
+    L6470.init();         // setup SPI and then init chips
   #endif
 
-  #if ENABLED(DISABLE_JTAG)
-    // Disable JTAG on AT90USB chips to free up pins for IO
-    MCUCR = 0x80;
-    MCUCR = 0x80;
+  #if ENABLED(MAX7219_DEBUG)
+    max7219.init();
+  #endif
+
+  #if ENABLED(DISABLE_DEBUG)
+    // Disable any hardware debug to free up pins for IO
+    #ifdef JTAGSWD_DISABLE
+      JTAGSWD_DISABLE();
+    #elif defined(JTAG_DISABLE)
+      JTAG_DISABLE();
+    #else
+      #error "DISABLE_DEBUG is not supported for the selected MCU/Board"
+    #endif
+  #elif ENABLED(DISABLE_JTAG)
+    // Disable JTAG to free up pins for IO
+    #ifdef JTAG_DISABLE
+      JTAG_DISABLE();
+    #else
+      #error "DISABLE_JTAG is not supported for the selected MCU/Board"
+    #endif
   #endif
 
   #if ENABLED(FILAMENT_RUNOUT_SENSOR)
@@ -709,10 +790,13 @@ void setup() {
     #endif
   #endif
 
-  SERIAL_PROTOCOLLNPGM("start");
+  SERIAL_ECHOLNPGM("start");
   SERIAL_ECHO_START();
 
-  #if HAS_DRIVER(TMC2130)
+  #if TMC_HAS_SPI
+    #if DISABLED(TMC_USE_SW_SPI)
+      SPI.begin();
+    #endif
     tmc_init_cs_pins();
   #endif
   #if HAS_DRIVER(TMC2208)
@@ -742,8 +826,7 @@ void setup() {
     SERIAL_ECHOPGM(MSG_CONFIGURATION_VER);
     SERIAL_ECHOPGM(STRING_DISTRIBUTION_DATE);
     SERIAL_ECHOLNPGM(MSG_AUTHOR STRING_CONFIG_H_AUTHOR);
-    SERIAL_ECHO_START();
-    SERIAL_ECHOLNPGM("Compiled: " __DATE__);
+    SERIAL_ECHO_MSG("Compiled: " __DATE__);
   #endif
 
   SERIAL_ECHO_START();
@@ -764,7 +847,7 @@ void setup() {
   #endif
 
   // Vital to init stepper/planner equivalent for current_position
-  SYNC_PLAN_POSITION_KINEMATIC();
+  sync_plan_position();
 
   thermalManager.init();    // Initialize temperature loop
 
@@ -786,10 +869,6 @@ void setup() {
     OUT_WRITE(PHOTOGRAPH_PIN, LOW);
   #endif
 
-  #if HAS_CASE_LIGHT
-    update_case_light();
-  #endif
-
   #if ENABLED(SPINDLE_LASER_ENABLE)
     OUT_WRITE(SPINDLE_LASER_ENABLE_PIN, !SPINDLE_LASER_ENABLE_INVERT);  // init spindle to off
     #if SPINDLE_DIR_CHANGE
@@ -806,7 +885,7 @@ void setup() {
   #endif
 
   #if ENABLED(USE_CONTROLLER_FAN)
-    SET_OUTPUT(CONTROLLER_FAN_PIN); //Set pin used for driver cooling fan
+    SET_OUTPUT(CONTROLLER_FAN_PIN);
   #endif
 
   #if HAS_STEPPER_RESET
@@ -822,7 +901,7 @@ void setup() {
   #endif
 
   #if (ENABLED(Z_PROBE_SLED) || ENABLED(SOLENOID_PROBE)) && HAS_SOLENOID_1
-    OUT_WRITE(SOL1_PIN, LOW); // turn it off
+    OUT_WRITE(SOL1_PIN, LOW); // OFF
   #endif
 
   #if HAS_HOME
@@ -830,24 +909,22 @@ void setup() {
   #endif
 
   #if PIN_EXISTS(STAT_LED_RED)
-    OUT_WRITE(STAT_LED_RED_PIN, LOW); // turn it off
+    OUT_WRITE(STAT_LED_RED_PIN, LOW); // OFF
   #endif
 
   #if PIN_EXISTS(STAT_LED_BLUE)
-    OUT_WRITE(STAT_LED_BLUE_PIN, LOW); // turn it off
+    OUT_WRITE(STAT_LED_BLUE_PIN, LOW); // OFF
   #endif
 
   #if HAS_COLOR_LEDS
     leds.setup();
   #endif
 
-  #if ENABLED(RGB_LED) || ENABLED(RGBW_LED)
-    SET_OUTPUT(RGB_LED_R_PIN);
-    SET_OUTPUT(RGB_LED_G_PIN);
-    SET_OUTPUT(RGB_LED_B_PIN);
-    #if ENABLED(RGBW_LED)
-      SET_OUTPUT(RGB_LED_W_PIN);
+  #if HAS_CASE_LIGHT
+    #if DISABLED(CASE_LIGHT_USE_NEOPIXEL)
+      SET_OUTPUT(CASE_LIGHT_PIN);
     #endif
+    update_case_light();
   #endif
 
   #if ENABLED(MK2_MULTIPLEXER)
@@ -860,15 +937,15 @@ void setup() {
     fanmux_init();
   #endif
 
-  lcd_init();
-  lcd_reset_status();
+  ui.init();
+  ui.reset_status();
 
   #if ENABLED(SHOW_BOOTSCREEN)
-    lcd_bootscreen();
+    ui.show_bootscreen();
   #endif
 
-  #if ENABLED(MIXING_EXTRUDER) && MIXING_VIRTUAL_TOOLS > 1
-    mixing_tools_init();
+  #if ENABLED(MIXING_EXTRUDER)
+    mixer.init();
   #endif
 
   #if ENABLED(BLTOUCH)
@@ -885,11 +962,11 @@ void setup() {
   #endif
 
   #if DO_SWITCH_EXTRUDER
-    move_extruder_servo(0);  // Initialize extruder servo
+    move_extruder_servo(0);   // Initialize extruder servo
   #endif
 
   #if ENABLED(SWITCHING_NOZZLE)
-    move_nozzle_servo(0);  // Initialize nozzle servo
+    move_nozzle_servo(0);     // Initialize nozzle servo
   #endif
 
   #if ENABLED(PARKING_EXTRUDER)
@@ -897,11 +974,27 @@ void setup() {
   #endif
 
   #if ENABLED(POWER_LOSS_RECOVERY)
-    check_print_job_recovery();
+    recovery.check();
   #endif
 
-  #if ENABLED(USE_WATCHDOG) // Reinit watchdog after HAL_get_reset_source call
-    watchdog_init();
+  #if ENABLED(USE_WATCHDOG)
+    watchdog_init();          // Reinit watchdog after HAL_get_reset_source call
+  #endif
+
+  #if ENABLED(EXTERNAL_CLOSED_LOOP_CONTROLLER)
+    init_closedloop();
+  #endif
+
+  #if ENABLED(SDSUPPORT) && DISABLED(ULTRA_LCD)
+    card.beginautostart();
+  #endif
+
+  #if HAS_TRINAMIC && DISABLED(PS_DEFAULT_OFF)
+    test_tmc_connection(true, true, true, true);
+  #endif
+
+  #if ENABLED(PRUSA_MMU2)
+    mmu2.init();
   #endif
 }
 
@@ -919,11 +1012,8 @@ void loop() {
 
     #if ENABLED(SDSUPPORT)
       card.checkautostart();
-    #endif
 
-    #if ENABLED(SDSUPPORT) && ENABLED(ULTIPANEL)
-      if (abort_sd_printing) {
-        abort_sd_printing = false;
+      if (card.flag.abort_sd_printing) {
         card.stopSDPrint(
           #if SD_RESORT
             true
@@ -933,15 +1023,13 @@ void loop() {
         quickstop_stepper();
         print_job_timer.stop();
         thermalManager.disable_all_heaters();
-        #if FAN_COUNT > 0
-          for (uint8_t i = 0; i < FAN_COUNT; i++) fanSpeeds[i] = 0;
-        #endif
+        thermalManager.zero_fan_speeds();
         wait_for_heatup = false;
         #if ENABLED(POWER_LOSS_RECOVERY)
           card.removeJobRecoveryFile();
         #endif
       }
-    #endif // SDSUPPORT && ULTIPANEL
+    #endif // SDSUPPORT
 
     if (commands_in_queue < BUFSIZE) get_available_commands();
     advance_command_queue();

@@ -31,6 +31,7 @@ Stopwatch print_job_timer;      // Global Print Job Timer instance
 
 #include "printcounter.h"
 #include "../Marlin.h"
+#include "../HAL/shared/persistent_store_api.h"
 
 PrintCounter print_job_timer;   // Global Print Job Timer instance
 
@@ -38,8 +39,6 @@ printStatistics PrintCounter::data;
 
 const PrintCounter::promdress PrintCounter::address = STATS_EEPROM_ADDRESS;
 
-const uint16_t PrintCounter::updateInterval = 10;
-const uint16_t PrintCounter::saveInterval = 3600;
 millis_t PrintCounter::lastDuration;
 bool PrintCounter::loaded = false;
 
@@ -73,7 +72,9 @@ void PrintCounter::initStats() {
   data = { 0, 0, 0, 0, 0.0 };
 
   saveStats();
-  eeprom_write_byte((uint8_t*)address, 0x16);
+  persistentStore.access_start();
+  persistentStore.write_data(address, (uint8_t)0x16);
+  persistentStore.access_finish();
 }
 
 void PrintCounter::loadStats() {
@@ -81,11 +82,15 @@ void PrintCounter::loadStats() {
     debug(PSTR("loadStats"));
   #endif
 
-  // Checks if the EEPROM block is initialized
-  if (eeprom_read_byte((uint8_t*)address) != 0x16) initStats();
-  else eeprom_read_block(&data,
-    (void*)(address + sizeof(uint8_t)), sizeof(printStatistics));
-
+  // Check if the EEPROM block is initialized
+  uint8_t value = 0;
+  persistentStore.access_start();
+  persistentStore.read_data(address, &value, sizeof(uint8_t));
+  if (value != 0x16)
+    initStats();
+  else
+    persistentStore.read_data(address + sizeof(uint8_t), (uint8_t*)&data, sizeof(printStatistics));
+  persistentStore.access_finish();
   loaded = true;
 }
 
@@ -98,14 +103,15 @@ void PrintCounter::saveStats() {
   if (!isLoaded()) return;
 
   // Saves the struct to EEPROM
-  eeprom_update_block(&data,
-    (void*)(address + sizeof(uint8_t)), sizeof(printStatistics));
+  persistentStore.access_start();
+  persistentStore.write_data(address + sizeof(uint8_t), (uint8_t*)&data, sizeof(printStatistics));
+  persistentStore.access_finish();
 }
 
 void PrintCounter::showStats() {
   char buffer[21];
 
-  SERIAL_PROTOCOLPGM(MSG_STATS);
+  SERIAL_ECHOPGM(MSG_STATS);
 
   SERIAL_ECHOPGM("Prints: ");
   SERIAL_ECHO(data.totalPrints);
@@ -118,7 +124,7 @@ void PrintCounter::showStats() {
     - ((isRunning() || isPaused()) ? 1 : 0));
 
   SERIAL_EOL();
-  SERIAL_PROTOCOLPGM(MSG_STATS);
+  SERIAL_ECHOPGM(MSG_STATS);
 
   duration_t elapsed = data.printTime;
   elapsed.toString(buffer);
@@ -145,7 +151,7 @@ void PrintCounter::showStats() {
   #endif
 
   SERIAL_EOL();
-  SERIAL_PROTOCOLPGM(MSG_STATS);
+  SERIAL_ECHOPGM(MSG_STATS);
 
   SERIAL_ECHOPGM("Filament used: ");
   SERIAL_ECHO(data.filamentUsed / 1000);
@@ -157,27 +163,20 @@ void PrintCounter::showStats() {
 void PrintCounter::tick() {
   if (!isRunning()) return;
 
-  static uint32_t update_last = millis(),
-                  eeprom_last = millis();
-
   millis_t now = millis();
 
-  // Trying to get the amount of calculations down to the bare min
-  const static uint16_t i = updateInterval * 1000;
-
-  if (now - update_last >= i) {
+  static uint32_t update_next; // = 0
+  if (ELAPSED(now, update_next)) {
     #if ENABLED(DEBUG_PRINTCOUNTER)
       debug(PSTR("tick"));
     #endif
-
     data.printTime += deltaDuration();
-    update_last = now;
+    update_next = now + updateInterval * 1000;
   }
 
-  // Trying to get the amount of calculations down to the bare min
-  const static millis_t j = saveInterval * 1000;
-  if (now - eeprom_last >= j) {
-    eeprom_last = now;
+  static uint32_t eeprom_next; // = 0
+  if (ELAPSED(now, eeprom_next)) {
+    eeprom_next = now + saveInterval * 1000;
     saveStats();
   }
 }
