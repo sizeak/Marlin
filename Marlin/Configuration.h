@@ -427,9 +427,9 @@
 
   // ANET A8 Standard Extruder at 210 Degree Celsius and 100% Fan
   //(measured after M106 S255 with M303 E0 S210 C8)
-#define DEFAULT_Kp 51.11
-#define DEFAULT_Ki 7.43
-#define DEFAULT_Kd 87.92
+#define DEFAULT_Kp 20.76
+#define DEFAULT_Ki 1.93
+#define DEFAULT_Kd 55.69
 
 #endif // PIDTEMP
 
@@ -833,7 +833,7 @@
 
 #define X_PROBE_OFFSET_FROM_EXTRUDER -20   // X offset: -left  +right  [of the nozzle]
 #define Y_PROBE_OFFSET_FROM_EXTRUDER -2   // Y offset: -front +behind [the nozzle]
-#define Z_PROBE_OFFSET_FROM_EXTRUDER -0.87   // Z offset: -below +above  [the nozzle]
+#define Z_PROBE_OFFSET_FROM_EXTRUDER -0.98   // Z offset: -below +above  [the nozzle]
 
 // Certain types of probes need to stay away from edges
 #define MIN_PROBE_EDGE 15
