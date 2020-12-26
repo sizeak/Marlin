@@ -501,9 +501,9 @@
 
   // ANET A8 Standard Extruder at 210 Degree Celsius and 100% Fan
   //(measured after M106 S255 with M303 E0 S210 C8)
-#define DEFAULT_Kp 20.76
-#define DEFAULT_Ki 1.93
-#define DEFAULT_Kd 55.69
+#define DEFAULT_Kp 19.16
+#define DEFAULT_Ki 1.56
+#define DEFAULT_Kd 58.87
 
 #endif // PIDTEMP
 
@@ -964,7 +964,7 @@
  *
  * Specify a Probe position as { X, Y, Z }
  */
-#define NOZZLE_TO_PROBE_OFFSET { -20, -2, -1.94 }
+#define NOZZLE_TO_PROBE_OFFSET { -25, -12, -1.94 }
 
 // Most probes should stay away from the edges of the bed, but
 // with NOZZLE_AS_PROBE this can be negative for a wider probing area.
